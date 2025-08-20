@@ -1,11 +1,16 @@
-import os, re, uuid, time
+import os, re, uuid, sys
+from pathlib import Path
 from urllib.parse import urljoin, urldefrag
 import trafilatura
 import requests
 from bs4 import BeautifulSoup
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-# from libs.storage.clickhouse import ch, init_schema
-# from libs.retriever.qdrant_db import ensure_collection, upsert
+
+# Добавляем путь к корню проекта
+sys.path.append(Path(__file__).parent.parent.parent.parent.__str__())
+
+
+from libs.retriever.qdrant_db import ensure_collection, upsert
 
 COLLECTION = "pydocs"
 BASE = "https://docs.python.org/3/"
@@ -31,7 +36,6 @@ def list_pages(limit=None):
 
     Notes:
         - Обрабатываются только прямые ссылки со страницы `contents.html`; рекурсивного обхода нет.
-        - Фрагменты URL (`#anchor`) не удаляются; при необходимости обработайте отдельно.
         - Требуются глобальная константа BASE и импорты: `requests`, `bs4.BeautifulSoup`, `urllib.parse.urljoin`.
         - Выполняется сетевой ввод-вывод; учитывайте это в тестах (рекомендуется моксеть запрос).
 
@@ -71,10 +75,25 @@ def chunk(text: str, size=500, overlap=50):
     )
     return splitter.split_text(text)
 
+def preprocess_text(text: str) -> str:
+    """
+    Минимальная нормализация markdown-текста:
+    - нормализация переводов строк
+    - схлопывание множественных пробелов
+    - ограничение подряд идущих пустых строк до 1-2
+    - обрезка пробелов по краям
+    """
+    if not text:
+        return ""
+    t = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Оставляем структуру абзацев, но убираем избыточные пробелы
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = t.strip()
+    return t
+
 def main():
-    # init_schema()
-    # ensure_collection(COLLECTION)
-    # client = ch()
+    ensure_collection(COLLECTION)
 
     pages = list_pages(limit=int(os.getenv("INGEST_LIMIT", "50")))
     total, inserted = 0, 0
@@ -84,19 +103,31 @@ def main():
             txt = fetch_clean(url)
             if not txt: continue
             parts = chunk(txt, size=int(os.getenv("CHUNK_SIZE","500")), overlap=int(os.getenv("CHUNK_OVERLAP","50")))
+            # Препроцессинг и фильтрация чанков
+            min_chars = int(os.getenv("MIN_CHUNK_CHARS", "200"))
+            seen = set()
+            cleaned_parts = []
+            for raw in parts:
+                cleaned = preprocess_text(raw)
+                if len(cleaned) < min_chars:
+                    continue
+                if cleaned in seen:
+                    continue
+                seen.add(cleaned)
+                cleaned_parts.append(cleaned)
             title = url.rsplit("/",1)[-1]
             doc_id = str(uuid.uuid4())
 
-            # ClickHouse insert
             rows = []
             payloads = []
-            for idx, t in enumerate(parts):
+            for idx, t in enumerate(cleaned_parts):
                 rows.append({
                     "id": doc_id, "source": "python-docs", "title": title, "url": url,
                     "chunk_id": idx, "text": t, "section": "", # можно распарсить h2/h3 при желании
                 })
+                point_id = str(uuid.uuid4())
                 payloads.append({
-                    "id": f"{doc_id}-{idx}",
+                    "id": point_id,
                     "doc_id": doc_id,
                     "chunk_id": idx,
                     "title": title,
@@ -105,16 +136,15 @@ def main():
                     "text": t
                 })
 
-            # client.insert("rag.docs", rows)
-            # upsert(COLLECTION, payloads)
+            if payloads:
+                upsert(COLLECTION, payloads)
 
-            inserted += len(parts)
+            inserted += len(cleaned_parts)
         except Exception as e:
             print("ERR", url, e)
         finally:
             total += 1
 
-    # client.insert("rag.etl_runs", [{"source":"python-docs","items":total,"ok":inserted,"failed":max(0,total-inserted),"notes":""}])
     print(f"Done: pages={total}, chunks={inserted}")
 
 if __name__ == "__main__":
