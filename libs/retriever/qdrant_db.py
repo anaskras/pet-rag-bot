@@ -11,7 +11,13 @@ from libs.embedding.encoder import encode_texts, dim
 
 def client():
     url = os.getenv("QDRANT_URL", "http://localhost:6333")
-    return QdrantClient(url=url)
+    cl = QdrantClient(
+        url=url,
+        timeout=60.0,              # общий таймаут
+        prefer_grpc=True,          # быстрее/стабильнее, если открыт 6334
+        grpc_port=6334
+    )
+    return cl
 
 
 def ensure_collection(name: str):
@@ -35,5 +41,17 @@ def search(collection: str, query: str, limit=5, filters=None):
     res = client().search(collection_name=collection, query_vector=vec, limit=limit, query_filter=filters)
     # возвратим payload, чтобы был text/url/section/ids
     return [hit.payload for hit in res]
+
+
+def search_with_scores(collection: str, query: str, limit=5, filters=None):
+    """
+    Выполняет поиск и возвращает payload вместе со score для последующего ранжирования/отладки.
+
+    Returns:
+        list[dict]: [{"payload": <payload>, "score": <float>}, ...]
+    """
+    vec = encode_texts([query])[0]
+    res = client().search(collection_name=collection, query_vector=vec, limit=limit, query_filter=filters)
+    return [{"payload": hit.payload, "score": float(hit.score)} for hit in res]
 
 
